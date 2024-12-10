@@ -7,15 +7,15 @@ import (
 	v6 "github.com/anchore/grype/grype/db/v6"
 )
 
-type Row struct {
-	Vulnerability vulnerability          `json:"vulnerability"`
+type AffectedPackageTableRow struct {
+	Vulnerability VulnerabilityRow       `json:"vulnerability"`
 	OS            *OS                    `json:"os,omitempty"`
 	Package       *Package               `json:"package,omitempty"`
 	CPE           *v6.Cpe                `json:"cpe,omitempty"`
 	Detail        v6.AffectedPackageBlob `json:"detail"`
 }
 
-type vulnerability struct {
+type VulnerabilityRow struct {
 	v6.VulnerabilityBlob `json:",inline"`
 	Provider             string     `json:"provider"`
 	Status               string     `json:"status"`
@@ -24,13 +24,13 @@ type vulnerability struct {
 	WithdrawnDate        *time.Time `json:"withdrawn_date"`
 }
 
-func (r Row) MarshalJSON() ([]byte, error) {
+func (r AffectedPackageTableRow) MarshalJSON() ([]byte, error) {
 	var cpe string
 	if r.CPE != nil {
 		cpe = r.CPE.String()
 	}
 	return json.Marshal(&struct {
-		Vulnerability vulnerability          `json:"vulnerability"`
+		Vulnerability VulnerabilityRow       `json:"vulnerability"`
 		OS            *OS                    `json:"os,omitempty"`
 		Package       *Package               `json:"package,omitempty"`
 		CPE           string                 `json:"cpe,omitempty"`
@@ -54,15 +54,15 @@ type OS struct {
 	Version string `json:"version"`
 }
 
-func NewRows(affectedPkgs []v6.AffectedPackageHandle, affectedCPEs []v6.AffectedCPEHandle) []Row {
-	var rows []Row
+func NewAffectedPackageRows(affectedPkgs []v6.AffectedPackageHandle, affectedCPEs []v6.AffectedCPEHandle) []AffectedPackageTableRow {
+	var rows []AffectedPackageTableRow
 	for _, pkg := range affectedPkgs {
 		var detail v6.AffectedPackageBlob
 		if pkg.BlobValue != nil {
 			detail = *pkg.BlobValue
 		}
-		rows = append(rows, Row{
-			Vulnerability: toVulnerability(pkg.Vulnerability),
+		rows = append(rows, AffectedPackageTableRow{
+			Vulnerability: NewVulnerabilityRow(pkg.Vulnerability),
 			OS:            toOS(pkg.OperatingSystem),
 			Package:       toPackage(pkg.Package),
 			Detail:        detail,
@@ -74,8 +74,8 @@ func NewRows(affectedPkgs []v6.AffectedPackageHandle, affectedCPEs []v6.Affected
 		if ac.BlobValue != nil {
 			detail = *ac.BlobValue
 		}
-		rows = append(rows, Row{
-			Vulnerability: toVulnerability(ac.Vulnerability),
+		rows = append(rows, AffectedPackageTableRow{
+			Vulnerability: NewVulnerabilityRow(ac.Vulnerability),
 			CPE:           ac.CPE,
 			Detail:        detail,
 		})
@@ -83,15 +83,27 @@ func NewRows(affectedPkgs []v6.AffectedPackageHandle, affectedCPEs []v6.Affected
 	return rows
 }
 
-func toVulnerability(vuln *v6.VulnerabilityHandle) vulnerability {
+func NewVulnerabilityRows(vulns ...*v6.VulnerabilityHandle) []VulnerabilityRow {
+	if len(vulns) == 0 {
+		return nil
+	}
+	var rows []VulnerabilityRow
+
+	for _, vuln := range vulns {
+		rows = append(rows, NewVulnerabilityRow(vuln))
+	}
+	return rows
+}
+
+func NewVulnerabilityRow(vuln *v6.VulnerabilityHandle) VulnerabilityRow {
 	if vuln == nil {
-		return vulnerability{}
+		return VulnerabilityRow{}
 	}
 	var blob v6.VulnerabilityBlob
 	if vuln.BlobValue != nil {
 		blob = *vuln.BlobValue
 	}
-	return vulnerability{
+	return VulnerabilityRow{
 		VulnerabilityBlob: blob,
 		Provider:          vuln.Provider.ID,
 		Status:            vuln.Status,

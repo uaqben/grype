@@ -188,13 +188,13 @@ type VulnerabilityAlias struct {
 // name (which might or might not be the product name in the CPE), in which case AffectedCPEHandle should be used.
 type AffectedPackageHandle struct {
 	ID              ID                   `gorm:"column:id;primaryKey"`
-	VulnerabilityID ID                   `gorm:"column:vulnerability_id;not null"`
+	VulnerabilityID ID                   `gorm:"column:vulnerability_id;index;not null"`
 	Vulnerability   *VulnerabilityHandle `gorm:"foreignKey:VulnerabilityID"`
 
-	OperatingSystemID *ID              `gorm:"column:operating_system_id"`
+	OperatingSystemID *ID              `gorm:"column:operating_system_id;index"`
 	OperatingSystem   *OperatingSystem `gorm:"foreignKey:OperatingSystemID"`
 
-	PackageID ID       `gorm:"column:package_id"`
+	PackageID ID       `gorm:"column:package_id;index"`
 	Package   *Package `gorm:"foreignKey:PackageID"`
 
 	BlobID    ID                   `gorm:"column:blob_id"`
@@ -283,7 +283,7 @@ type OperatingSystem struct {
 	MajorVersion string `gorm:"column:major_version;index:os_idx,unique"`
 	MinorVersion string `gorm:"column:minor_version;index:os_idx,unique"`
 	LabelVersion string `gorm:"column:label_version;index:os_idx,unique"`
-	Codename     string `gorm:"column:codename"`
+	Codename     string `gorm:"column:codename"` // TODO: should this be removed and use label-version instead?
 }
 
 func (os *OperatingSystem) VersionNumber() string {
