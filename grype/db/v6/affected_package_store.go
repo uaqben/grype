@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gorm.io/gorm"
@@ -12,9 +13,14 @@ import (
 	"github.com/anchore/syft/syft/cpe"
 )
 
-var NoDistroSpecified = &DistroSpecifier{}
-var AnyDistroSpecified *DistroSpecifier
-var ErrMissingDistroIdentification = errors.New("missing distro name or codename")
+const (
+	pkgNotSpecified = "not-specified"
+	anyOS           = "any"
+)
+
+var NoOSSpecified = &OSSpecifier{}
+var AnyOSSpecified *OSSpecifier
+var ErrMissingDistroIdentification = errors.New("missing os name or codename")
 var ErrDistroNotPresent = errors.New("distro not present")
 var ErrMultipleOSMatches = errors.New("multiple OS matches found but not allowed")
 
@@ -24,9 +30,11 @@ type GetAffectedPackageOptions struct {
 	PreloadPackageCPEs   bool
 	PreloadVulnerability bool
 	PreloadBlob          bool
-	Distro               *DistroSpecifier
-	Vulnerability        *VulnerabilitySpecifier
+	OSs                  []*OSSpecifier
+	Vulnerabilities      []VulnerabilitySpecifier
 }
+
+type PackageSpecifiers []*PackageSpecifier
 
 type PackageSpecifier struct {
 	Name string
@@ -36,7 +44,7 @@ type PackageSpecifier struct {
 
 func (p *PackageSpecifier) String() string {
 	if p == nil {
-		return "no-package-specified"
+		return pkgNotSpecified
 	}
 
 	var args []string
@@ -53,14 +61,28 @@ func (p *PackageSpecifier) String() string {
 	}
 
 	if len(args) > 0 {
-		return fmt.Sprintf("pkg(%s)", strings.Join(args, ", "))
+		return fmt.Sprintf("package(%s)", strings.Join(args, ", "))
 	}
 
-	return "no-package-specified"
+	return pkgNotSpecified
 }
 
-// DistroSpecifier is a struct that represents a distro in a way that can be used to query the affected package store.
-type DistroSpecifier struct {
+func (p PackageSpecifiers) String() string {
+	if len(p) == 0 {
+		return pkgNotSpecified
+	}
+
+	var parts []string
+	for _, v := range p {
+		parts = append(parts, v.String())
+	}
+	return strings.Join(parts, ", ")
+}
+
+type OSSpecifiers []*OSSpecifier
+
+// OSSpecifier is a struct that represents a distro in a way that can be used to query the affected package store.
+type OSSpecifier struct {
 	// Name of the distro as identified by the ID field in /etc/os-release
 	Name string
 
@@ -81,7 +103,37 @@ type DistroSpecifier struct {
 	AllowMultiple bool
 }
 
-func (d DistroSpecifier) version() string {
+func (d *OSSpecifier) String() string {
+	if d == nil {
+		return anyOS
+	}
+
+	if *d == *NoOSSpecified {
+		return "none"
+	}
+
+	var version string
+	if d.MajorVersion != "" {
+		version = d.MajorVersion
+		if d.MinorVersion != "" {
+			version += "." + d.MinorVersion
+		}
+	} else {
+		version = d.Codename
+	}
+
+	distroDisplayName := d.Name
+	if version != "" {
+		distroDisplayName += "@" + version
+	}
+	if version == d.MajorVersion && d.Codename != "" {
+		distroDisplayName += " (" + d.Codename + ")"
+	}
+
+	return distroDisplayName
+}
+
+func (d OSSpecifier) version() string {
 	if d.MajorVersion != "" && d.MinorVersion != "" {
 		return d.MajorVersion + "." + d.MinorVersion
 	}
@@ -101,7 +153,28 @@ func (d DistroSpecifier) version() string {
 	return ""
 }
 
-func (d DistroSpecifier) matchesVersionPattern(pattern string) bool {
+func (d OSSpecifiers) String() string {
+	if d.IsAny() {
+		return anyOS
+	}
+	var parts []string
+	for _, v := range d {
+		parts = append(parts, v.String())
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (d OSSpecifiers) IsAny() bool {
+	if len(d) == 0 {
+		return true
+	}
+	if len(d) == 1 && d[0] == AnyOSSpecified {
+		return true
+	}
+	return false
+}
+
+func (d OSSpecifier) matchesVersionPattern(pattern string) bool {
 	// check if version or version label matches the given regex
 	r, err := regexp.Compile(pattern)
 	if err != nil {
@@ -156,17 +229,17 @@ func (s *affectedPackageStore) GetAffectedPackages(pkg *PackageSpecifier, config
 		config = &GetAffectedPackageOptions{}
 	}
 
-	log.WithFields("pkg", pkg.String(), "distro", distroDisplay(config.Distro)).Trace("fetching AffectedPackage record")
+	log.WithFields("pkg", pkg.String(), "distro", config.OSs).Trace("fetching AffectedPackage record")
 
 	query := s.handlePackage(s.db, pkg)
 
 	var err error
-	query, err = s.handleVulnerabilityOptions(query, config.Vulnerability)
+	query, err = s.handleVulnerabilityOptions(query, config.Vulnerabilities)
 	if err != nil {
 		return nil, err
 	}
 
-	query, err = s.handleDistroOptions(query, config.Distro)
+	query, err = s.handleOSOptions(query, config.OSs)
 	if err != nil {
 		return nil, err
 	}
@@ -221,57 +294,82 @@ func (s *affectedPackageStore) handlePackage(query *gorm.DB, config *PackageSpec
 	return query
 }
 
-func (s *affectedPackageStore) handleVulnerabilityOptions(query *gorm.DB, config *VulnerabilitySpecifier) (*gorm.DB, error) {
-	if config == nil {
+func (s *affectedPackageStore) handleVulnerabilityOptions(query *gorm.DB, configs []VulnerabilitySpecifier) (*gorm.DB, error) {
+	if len(configs) == 0 {
 		return query, nil
 	}
 	query = query.Joins("JOIN vulnerability_handles ON affected_package_handles.vulnerability_id = vulnerability_handles.id")
 
-	return handleVulnerabilityOptions(query, config)
+	return handleVulnerabilityOptions(s.db, query, configs...)
 }
 
-func (s *affectedPackageStore) handleDistroOptions(query *gorm.DB, config *DistroSpecifier) (*gorm.DB, error) {
-	var resolvedDistros []OperatingSystem
-	var err error
+func (s *affectedPackageStore) handleOSOptions(query *gorm.DB, configs []*OSSpecifier) (*gorm.DB, error) {
+	resolvedDistroMap := make(map[int64]OperatingSystem)
 
-	switch {
-	case hasDistroSpecified(config):
-		resolvedDistros, err = s.resolveDistro(*config)
-		if err != nil {
-			return nil, fmt.Errorf("unable to resolve distro: %w", err)
-		}
+	if len(configs) == 0 {
+		configs = append(configs, AnyOSSpecified)
+	}
 
+	var hasAny, hasNone, hasSpecific bool
+	for _, config := range configs {
 		switch {
-		case len(resolvedDistros) == 0:
-			return nil, ErrDistroNotPresent
-		case len(resolvedDistros) > 1 && !config.AllowMultiple:
-			return nil, ErrMultipleOSMatches
+		case hasDistroSpecified(config):
+			curResolvedDistros, err := s.resolveDistro(*config)
+			if err != nil {
+				return nil, fmt.Errorf("unable to resolve distro: %w", err)
+			}
+
+			switch {
+			case len(curResolvedDistros) == 0:
+				return nil, ErrDistroNotPresent
+			case len(curResolvedDistros) > 1 && !config.AllowMultiple:
+				return nil, ErrMultipleOSMatches
+			}
+			hasSpecific = true
+			for _, d := range curResolvedDistros {
+				resolvedDistroMap[int64(d.ID)] = d
+			}
+		case config == AnyOSSpecified:
+			// TODO: one enhancement we may want to do later is "has OS defined but is not specific" which this does NOT cover. This is "may or may not have an OS defined" which is different.
+			hasAny = true
+		case *config == *NoOSSpecified:
+			hasNone = true
 		}
-	case config == AnyDistroSpecified:
-		// TODO: one enhancement we may want to do later is "has OS defined but is not specific" which this does NOT cover. This is "may or may not have an OS defined" which is different.
+	}
+
+	if (hasAny || hasNone) && hasSpecific {
+		return nil, fmt.Errorf("cannot mix specific distro with any or none distro specifiers")
+	}
+
+	var resolvedDistros []OperatingSystem
+	switch {
+	case hasAny:
 		return query, nil
-	case *config == *NoDistroSpecified:
+	case hasNone:
 		return query.Where("operating_system_id IS NULL"), nil
+	case hasSpecific:
+		for _, d := range resolvedDistroMap {
+			resolvedDistros = append(resolvedDistros, d)
+		}
+		sort.Slice(resolvedDistros, func(i, j int) bool {
+			return resolvedDistros[i].ID < resolvedDistros[j].ID
+		})
 	}
 
 	query = query.Joins("JOIN operating_systems ON affected_package_handles.operating_system_id = operating_systems.id")
 
-	var count int
-	for _, o := range resolvedDistros {
-		if o.ID != 0 {
-			if count == 0 {
-				query = query.Where("operating_systems.id = ?", o.ID)
-			} else {
-				query = query.Or("operating_systems.id = ?", o.ID)
-			}
-			count++
+	if len(resolvedDistros) > 0 {
+		orClauses := s.db
+		for _, o := range resolvedDistros {
+			orClauses = orClauses.Or("operating_systems.id = ?", o.ID)
 		}
+		query = query.Where(orClauses)
 	}
 
 	return query, nil
 }
 
-func (s *affectedPackageStore) resolveDistro(d DistroSpecifier) ([]OperatingSystem, error) {
+func (s *affectedPackageStore) resolveDistro(d OSSpecifier) ([]OperatingSystem, error) {
 	if d.Name == "" && d.Codename == "" {
 		return nil, ErrMissingDistroIdentification
 	}
@@ -300,7 +398,7 @@ func (s *affectedPackageStore) resolveDistro(d DistroSpecifier) ([]OperatingSyst
 	return s.searchForDistroVersionVariants(query, d)
 }
 
-func (s *affectedPackageStore) searchForDistroVersionVariants(query *gorm.DB, d DistroSpecifier) ([]OperatingSystem, error) {
+func (s *affectedPackageStore) searchForDistroVersionVariants(query *gorm.DB, d OSSpecifier) ([]OperatingSystem, error) {
 	var allOs []OperatingSystem
 
 	handleQuery := func(q *gorm.DB, desc string) ([]OperatingSystem, error) {
@@ -354,7 +452,7 @@ func (s *affectedPackageStore) searchForDistroVersionVariants(query *gorm.DB, d 
 	return allOs, nil
 }
 
-func (s *affectedPackageStore) applyAlias(d *DistroSpecifier) error {
+func (s *affectedPackageStore) applyAlias(d *OSSpecifier) error {
 	if d.Name == "" {
 		return nil
 	}
@@ -473,42 +571,12 @@ func handleCPEOptions(query *gorm.DB, c *cpe.Attributes) *gorm.DB {
 	return query
 }
 
-func distroDisplay(d *DistroSpecifier) string {
-	if d == nil {
-		return "any"
-	}
-
-	if *d == *NoDistroSpecified {
-		return "none"
-	}
-
-	var version string
-	if d.MajorVersion != "" {
-		version = d.MajorVersion
-		if d.MinorVersion != "" {
-			version += "." + d.MinorVersion
-		}
-	} else {
-		version = d.Codename
-	}
-
-	distroDisplayName := d.Name
-	if version != "" {
-		distroDisplayName += "@" + version
-	}
-	if version == d.MajorVersion && d.Codename != "" {
-		distroDisplayName += " (" + d.Codename + ")"
-	}
-
-	return distroDisplayName
-}
-
-func hasDistroSpecified(d *DistroSpecifier) bool {
-	if d == AnyDistroSpecified {
+func hasDistroSpecified(d *OSSpecifier) bool {
+	if d == AnyOSSpecified {
 		return false
 	}
 
-	if *d == *NoDistroSpecified {
+	if *d == *NoOSSpecified {
 		return false
 	}
 	return true
